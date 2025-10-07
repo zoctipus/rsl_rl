@@ -418,16 +418,14 @@ class PPO:
 
     def broadcast_parameters(self) -> None:
         """Broadcast model parameters to all GPUs."""
-        # Obtain the model parameters on current GPU
-        model_params = [self.policy.state_dict()]
+        # Broadcast policy parameters
+        for param in self.policy.parameters():
+            torch.distributed.broadcast(param.data, src=0)
+
+        # Broadcast RND parameters if they exist
         if self.rnd:
-            model_params.append(self.rnd.predictor.state_dict())
-        # Broadcast the model parameters
-        torch.distributed.broadcast_object_list(model_params, src=0)
-        # Load the model parameters on all GPUs from source GPU
-        self.policy.load_state_dict(model_params[0])
-        if self.rnd:
-            self.rnd.predictor.load_state_dict(model_params[1])
+            for param in self.rnd.predictor.parameters():
+                torch.distributed.broadcast(param.data, src=0)
 
     def reduce_parameters(self) -> None:
         """Collect gradients from all GPUs and average them.
