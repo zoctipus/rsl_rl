@@ -390,7 +390,8 @@ class OnPolicyRunner:
             )
 
         # initialize torch distributed
-        torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
+        if not torch.distributed.is_initialized():
+            torch.distributed.init_process_group(backend="nccl", rank=self.gpu_global_rank, world_size=self.gpu_world_size)
         # set device to the local rank
         torch.cuda.set_device(self.gpu_local_rank)
 
