@@ -7,9 +7,137 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from torch.distributions import Normal
+from torch.distributions import Normal, Distribution, constraints
+from typing import Optional
 
 from rsl_rl.networks import MLP, EmpiricalNormalization
+
+
+class GSDENoiseDistribution(Distribution):
+    """
+    Distribution class for generalized State Dependent Exploration (gSDE)-style noise
+    using latent features of the policy network.
+    """
+
+    has_rsample = True
+    arg_constraints = {
+        "mean_actions": constraints.real,
+        "log_std": constraints.real,
+        "latent_features": constraints.real,
+    }
+    _validate_args = False
+
+    def __init__(
+        self,
+        action_dim: int,
+        epsilon: float = 1e-6,
+        batch_shape: torch.Size = torch.Size(),
+        event_shape: torch.Size = torch.Size(),
+        validate_args: Optional[bool] = None,
+    ):
+        self.action_dim = action_dim
+        self.epsilon = epsilon
+        self._base_distribution: Optional[Normal] = None
+        self._latent_features: Optional[torch.Tensor] = None
+        self._exploration_matrix: Optional[torch.Tensor] = None
+        self._exploration_matrices: Optional[torch.Tensor] = None
+        self._weights_distribution: Optional[Normal] = None
+        super().__init__(batch_shape, event_shape, validate_args)
+
+    def _std_from_log_std(self, log_std: torch.Tensor) -> torch.Tensor:
+        return torch.exp(log_std)
+
+    def sample_weights(self, log_std: torch.Tensor, batch_size: int = 1) -> None:
+        std = self._std_from_log_std(log_std)
+        weights_distribution = Normal(torch.zeros_like(std), std)
+        self._weights_distribution = weights_distribution
+        self._exploration_matrix = weights_distribution.rsample()
+        self._exploration_matrices = weights_distribution.rsample((batch_size,))
+
+    def proba_distribution(
+        self,
+        mean_actions: torch.Tensor,
+        log_std: torch.Tensor,
+        latent_features: torch.Tensor,
+    ) -> "GSDENoiseDistribution":
+        self._latent_features = latent_features
+        # move exploration matrices to the correct device
+        if self._exploration_matrix is not None:
+            self._exploration_matrix = self._exploration_matrix.to(latent_features.device)
+        if self._exploration_matrices is not None:
+            self._exploration_matrices = self._exploration_matrices.to(latent_features.device)
+        # variance per action: (phi(s)^2) @ (sigma^2)
+        variance = torch.mm(latent_features**2, self._std_from_log_std(log_std) ** 2)
+        self._base_distribution = Normal(mean_actions, torch.sqrt(variance + self.epsilon))
+        return self
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        if self._validate_args:
+            self._validate_sample(actions)
+        return self._base_distribution.log_prob(actions)
+
+    def entropy(self) -> torch.Tensor:
+        return self._base_distribution.entropy()
+
+    def sample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        with torch.no_grad():
+            return self.rsample(sample_shape)
+
+    def rsample(self, sample_shape: torch.Size = torch.Size()) -> torch.Tensor:
+        if self._base_distribution is None:
+            raise ValueError("Distribution not initialized. Call proba_distribution first.")
+        return self._base_distribution.rsample(sample_shape)
+
+    @property
+    def mean(self) -> torch.Tensor:
+        if self._base_distribution is None:
+            raise ValueError("Distribution not initialized. Call proba_distribution first.")
+        return self._base_distribution.mean
+
+    @property
+    def mode(self) -> torch.Tensor:
+        if self._base_distribution is None:
+            raise ValueError("Distribution not initialized. Call proba_distribution first.")
+        return self._base_distribution.mean
+
+    @property
+    def variance(self) -> torch.Tensor:
+        if self._base_distribution is None:
+            raise ValueError("Distribution not initialized. Call proba_distribution first.")
+        return self._base_distribution.variance
+
+    @property
+    def stddev(self) -> torch.Tensor:
+        if self._base_distribution is None:
+            raise ValueError("Distribution not initialized. Call proba_distribution first.")
+        return self._base_distribution.stddev
+
+    @property
+    def support(self) -> constraints.Constraint:
+        return constraints.real
+
+    def expand(self, batch_shape: torch.Size, _instance=None) -> "GSDENoiseDistribution":
+        new = self._get_checked_instance(GSDENoiseDistribution, _instance)
+        new.action_dim = self.action_dim
+        new.epsilon = self.epsilon
+        new._base_distribution = self._base_distribution
+        new._latent_features = self._latent_features
+        new._exploration_matrix = self._exploration_matrix
+        new._exploration_matrices = self._exploration_matrices
+        new._weights_distribution = self._weights_distribution
+        super(GSDENoiseDistribution, new).__init__(batch_shape, self._event_shape, validate_args=False)
+        return new
+
+    def get_noise(self, latent_features: torch.Tensor) -> torch.Tensor:
+        if (
+            self._exploration_matrices is None
+            or len(latent_features) == 1
+            or len(latent_features) != len(self._exploration_matrices)
+        ):
+            return torch.mm(latent_features, self._exploration_matrix)
+        latent_features = latent_features.unsqueeze(dim=1)
+        noise = torch.bmm(latent_features, self._exploration_matrices)
+        return noise.squeeze(dim=1)
 
 
 class ActorCritic(nn.Module):
@@ -50,7 +178,7 @@ class ActorCritic(nn.Module):
 
         self.state_dependent_std = state_dependent_std
         # actor
-        if self.state_dependent_std:
+        if self.state_dependent_std and noise_std_type != "gsde":
             self.actor = MLP(num_actor_obs, [2, num_actions], actor_hidden_dims, activation)
         else:
             self.actor = MLP(num_actor_obs, num_actions, actor_hidden_dims, activation)
@@ -74,28 +202,36 @@ class ActorCritic(nn.Module):
 
         # Action noise
         self.noise_std_type = noise_std_type
-        if self.state_dependent_std:
-            torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
-            if self.noise_std_type == "scalar":
-                torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
-            elif self.noise_std_type == "log":
-                torch.nn.init.constant_(
-                    self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
-                )
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        if self.noise_std_type == "gsde":
+            assert self.state_dependent_std, "noise_std_type 'gsde' requires state_dependent_std=True."
+            self.distribution = GSDENoiseDistribution(action_dim=num_actions)
+            self.log_std = nn.Parameter(
+                torch.ones(actor_hidden_dims[-1], num_actions) * torch.log(torch.tensor(init_noise_std))
+            )
+            self.distribution.sample_weights(self.log_std)
         else:
-            if self.noise_std_type == "scalar":
-                self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
-            elif self.noise_std_type == "log":
-                self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+            if self.state_dependent_std:
+                torch.nn.init.zeros_(self.actor[-2].weight[num_actions:])
+                if self.noise_std_type == "scalar":
+                    torch.nn.init.constant_(self.actor[-2].bias[num_actions:], init_noise_std)
+                elif self.noise_std_type == "log":
+                    torch.nn.init.constant_(
+                        self.actor[-2].bias[num_actions:], torch.log(torch.tensor(init_noise_std + 1e-7))
+                    )
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
             else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+                if self.noise_std_type == "scalar":
+                    self.std = nn.Parameter(init_noise_std * torch.ones(num_actions))
+                elif self.noise_std_type == "log":
+                    self.log_std = nn.Parameter(torch.log(init_noise_std * torch.ones(num_actions)))
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
 
-        # Action distribution (populated in update_distribution)
-        self.distribution = None
-        # disable args validation for speedup
-        Normal.set_default_validate_args(False)
+            # Action distribution (populated in update_distribution)
+            self.distribution = None
+            # disable args validation for speedup
+            Normal.set_default_validate_args(False)
 
     def reset(self, dones=None):
         pass
@@ -116,28 +252,37 @@ class ActorCritic(nn.Module):
         return self.distribution.entropy().sum(dim=-1)
 
     def update_distribution(self, obs):
-        if self.state_dependent_std:
-            # compute mean and standard deviation
-            mean_and_std = self.actor(obs)
-            if self.noise_std_type == "scalar":
-                mean, std = torch.unbind(mean_and_std, dim=-2)
-            elif self.noise_std_type == "log":
-                mean, log_std = torch.unbind(mean_and_std, dim=-2)
-                std = torch.exp(log_std)
-            else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+        if self.noise_std_type == "gsde":
+            assert self.state_dependent_std, "noise_std_type 'gsde' requires state_dependent_std=True."
+            _actor_modules = list(self.actor.children())
+            features = obs
+            for layer in _actor_modules[:-1]:
+                features = layer(features)
+            mean = _actor_modules[-1](features)
+            self.distribution.proba_distribution(mean, self.log_std, features)
         else:
-            # compute mean
-            mean = self.actor(obs)
-            # compute standard deviation
-            if self.noise_std_type == "scalar":
-                std = self.std.expand_as(mean)
-            elif self.noise_std_type == "log":
-                std = torch.exp(self.log_std).expand_as(mean)
+            if self.state_dependent_std:
+                # compute mean and standard deviation
+                mean_and_std = self.actor(obs)
+                if self.noise_std_type == "scalar":
+                    mean, std = torch.unbind(mean_and_std, dim=-2)
+                elif self.noise_std_type == "log":
+                    mean, log_std = torch.unbind(mean_and_std, dim=-2)
+                    std = torch.exp(log_std)
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
             else:
-                raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
-        # create distribution
-        self.distribution = Normal(mean, std)
+                # compute mean
+                mean = self.actor(obs)
+                # compute standard deviation
+                if self.noise_std_type == "scalar":
+                    std = self.std.expand_as(mean)
+                elif self.noise_std_type == "log":
+                    std = torch.exp(self.log_std).expand_as(mean)
+                else:
+                    raise ValueError(f"Unknown standard deviation type: {self.noise_std_type}. Should be 'scalar' or 'log'")
+            # create distribution
+            self.distribution = Normal(mean, std)
 
     def act(self, obs, **kwargs):
         obs = self.get_actor_obs(obs)
