@@ -8,6 +8,7 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from functools import reduce
+from collections import OrderedDict
 
 from rsl_rl.utils import resolve_nn_activation
 
@@ -106,3 +107,16 @@ class MLP(nn.Sequential):
         for layer in self:
             x = layer(x)
         return x
+
+    def __getitem__(self, idx):
+        """Enable slicing support by returning a plain Sequential when a slice is used."""
+        if isinstance(idx, slice):
+            return nn.Sequential(OrderedDict(list(self._modules.items())[idx]))
+        else:
+            return super().__getitem__(idx)
+
+    def reset(self, dones=None, hidden_states=None):
+        pass
+
+    def detach_hidden_states(self, dones=None):
+        pass
